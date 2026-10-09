@@ -1,0 +1,61 @@
+{
+  "app_name": "Lumina Academic / Anti-AI Tutor",
+  "theme": "light",
+  "archetype": "Organic & Earthy / Warm Academic Workspace",
+  "color_palette": {
+    "background": "#FDFBF7",
+    "surface": "#F7F3E9",
+    "surface_elevated": "#FFFFFF",
+    "primary": "#8C4A32",
+    "primary_hover": "#733B27",
+    "secondary": "#3D5A45",
+    "text_main": "#2C2825",
+    "text_muted": "#6E6861",
+    "border": "#E6DEC5",
+    "accent": "#C2783F",
+    "success": "#3D5A45",
+    "warning": "#B87D39",
+    "error": "#9E3C2F"
+  },
+  "typography": {
+    "font_family_headings": "Cormorant Garamond, Playfair Display, serif",
+    "font_family_body": "Plus Jakarta Sans, Inter, sans-serif",
+    "font_family_mono": "JetBrains Mono, monospace",
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tight font-bold",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight font-semibold",
+      "h3": "text-xl sm:text-2xl font-medium",
+      "h4": "text-lg sm:text-xl font-medium",
+      "body": "text-base sm:text-sm leading-relaxed",
+      "label": "text-xs uppercase tracking-[0.2em] font-semibold text-[#6E6861]"
+    }
+  },
+  "visual_enhancers": {
+    "border_radius": "rounded-xl",
+    "shadows": "shadow-[0_4px_24px_rgba(44,40,37,0.06)]",
+    "glassmorphism": "backdrop-blur-xl bg-[#FDFBF7]/80 border border-[#E6DEC5]",
+    "textures": "Subtle warm paper grain tone"
+  },
+  "component_path": "/app/frontend/src/components",
+  "instructions_to_main_agent": "Build a fully integrated, gorgeous academic workspace matching Track D requirements: Multimodal Knowledge Base ingestion (PDF, slides, lecture videos with timestamp extraction & diagram figures), Source-Grounded Q&A chat with exact citations and off-material flags, Adaptive Assessments (MCQ, short answer, numerical, repetition avoidance, cited feedback, weakness reports), Learner Model with per-topic mastery updates, System Evaluation Dashboard (faithfulness, answer relevancy, context precision/recall, simulated profiles), and Study Planning / Prerequisite Course Flow Map. Use warm paper tones (#FDFBF7, terracotta #8C4A32, forest #3D5A45, warm beige #F7F3E9). All interactive elements must have data-testid attributes.",
+  "universal_guidelines": [
+    "Never use pure black or pure white; always tint with warm undertones.",
+    "Ensure all interactive elements have data-testid attributes.",
+    "Use generous spacing (p-8, p-12) and asymmetry in bento grids.",
+    "Use Sonner for toast notifications.",
+    "Always provide visible desktop navigation and clear state indicators.",
+    "Never use AI assistant emojis like 🤖🧠💭💡🔮🎯 for icons."
+  ],
+  "image_urls": {
+    "hero_study_desk": {
+      "category": "hero",
+      "description": "Warm academic study desk with books and lamp",
+      "url": "https://images.unsplash.com/photo-1646054791640-62e00f540457?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxNzV8MHwxfHNlYXJjaHwzfHxhY2FkZW1pYyUyMGxpYnJhcnklMjBzdHVkeSUyMGRlc2slMjB3YXJtJTIwbGlnaHRpbmclMjBlZGl0b3JpYWx8ZW58MHx8fHwxNzkxNTU4NDA5fDA&ixlib=rb-4.1.0&q=85"
+    },
+    "library_background": {
+      "category": "background",
+      "description": "Classic library bookshelves with warm wood and books",
+      "url": "https://images.unsplash.com/photo-1722182877533-7378b60bf1e8?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxNzV8MHwxfHNlYXJjaHwxfHxhY2FkZW1pYyUyMGxpYnJhcnklMjBzdHVkeSUyMGRlc2slMjB3YXJtJTIwbGlnaHRpbmclMjBlZGl0b3JpYWx8ZW58MHx8fHwxNzkxNTU4NDA5fDA&ixlib=rb-4.1.0&q=85"
+    }
+  }
+}
