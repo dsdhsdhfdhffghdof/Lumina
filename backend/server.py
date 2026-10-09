@@ -1,10 +1,10 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, List
 import os, uuid, json, logging, requests
 
@@ -48,6 +48,9 @@ class QuizSubmit(BaseModel):
     question_id: str
     answer: str
 
+class AuthSession(BaseModel):
+    session_id: str
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -86,6 +89,62 @@ def put_object(path, data, content_type):
 @api.get("/")
 async def root():
     return {"message": "Lumina Academic API"}
+
+async def current_user(request: Request):
+    token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else None
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+    if not session:
+        raise HTTPException(401, "Session not found")
+    expiry = datetime.fromisoformat(session["expires_at"]) if isinstance(session["expires_at"], str) else session["expires_at"]
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry < datetime.now(timezone.utc):
+        raise HTTPException(401, "Session expired")
+    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
+
+@api.post("/auth/session")
+async def create_session(input: AuthSession, response: Response):
+    try:
+        result = requests.get("https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data", headers={"X-Session-ID": input.session_id}, timeout=30)
+        result.raise_for_status()
+        identity = result.json()
+    except requests.RequestException:
+        raise HTTPException(401, "Google session could not be verified")
+    user = await db.users.find_one({"email": identity["email"]}, {"_id": 0})
+    timestamp = now()
+    if user:
+        user_id = user["user_id"]
+        await db.users.update_one({"user_id": user_id}, {"$set": {"name": identity["name"], "picture": identity.get("picture", ""), "last_sign_in_at": timestamp}})
+    else:
+        user_id = "user_" + uuid.uuid4().hex[:12]
+        user = {"user_id": user_id, "google_id": identity["id"], "email": identity["email"], "name": identity["name"], "picture": identity.get("picture", ""), "created_at": timestamp, "first_sign_in_at": timestamp, "last_sign_in_at": timestamp, "learner_profile": {"level": "new", "preferred_language": "English"}, "course_progress": {}, "mastery": {}, "chat_history": []}
+        await db.users.insert_one(user)
+    expires = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    expires_at = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=7)).isoformat()
+    await db.user_sessions.insert_one({"user_id": user_id, "session_token": identity["session_token"], "created_at": expires, "expires_at": expires_at})
+    response.set_cookie("session_token", identity["session_token"], max_age=604800, httponly=True, secure=True, samesite="none", path="/")
+    saved = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    return saved
+
+@api.get("/auth/me")
+async def me(request: Request):
+    return await current_user(request)
+
+@api.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("session_token")
+    if token:
+        await db.user_sessions.delete_many({"session_token": token})
+    response.delete_cookie("session_token", path="/")
+    return {"ok": True}
 
 @api.get("/dashboard")
 async def dashboard():
@@ -143,7 +202,7 @@ async def study_plan():
     return [{"day": "Today", "title": "Repair the gradient", "detail": "12 min · concept map + 3 questions", "topic": "Electron transport chain", "color": "terracotta"}, {"day": "Tomorrow", "title": "Connect the cycles", "detail": "18 min · retrieval practice", "topic": "Krebs cycle", "color": "forest"}, {"day": "Friday", "title": "Full checkpoint", "detail": "25 min · mixed mock exam", "topic": "All Week 04", "color": "ochre"}]
 
 app.include_router(api)
-app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","), allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origin_regex=r".*", allow_methods=["*"], allow_headers=["*"])
 logging.basicConfig(level=logging.INFO)
 
 @app.on_event("shutdown")
