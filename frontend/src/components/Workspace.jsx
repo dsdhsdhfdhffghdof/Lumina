@@ -8,7 +8,8 @@ import {
 } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const ACCEPT = ".pdf,.docx,.txt,.md";
+const ACCEPT = ".pdf,.docx,.txt,.md,.png,.jpg,.jpeg,.webp,.tiff,.bmp";
+const ALLOWED_EXT = [".pdf",".docx",".txt",".md",".png",".jpg",".jpeg",".webp",".tiff",".bmp"];
 
 const navItems = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -88,8 +89,8 @@ function UploadModal({ open, onClose, onUploaded }) {
   const doUpload = async (file) => {
     if (!file) return;
     const ext = "." + (file.name.split(".").pop() || "").toLowerCase();
-    if (![".pdf", ".docx", ".txt", ".md"].includes(ext)) {
-      toast.error("Only PDF, DOCX, TXT, or MD");
+    if (!ALLOWED_EXT.includes(ext)) {
+      toast.error("Only PDF, DOCX, TXT, MD, or image files are supported");
       return;
     }
     if (file.size > 25 * 1024 * 1024) {
@@ -131,7 +132,7 @@ function UploadModal({ open, onClose, onUploaded }) {
           />
           <Upload size={22} />
           <b>{uploading ? `Uploading… ${progress}%` : "Choose a file"}</b>
-          <span>PDF · DOCX · TXT · MD</span>
+          <span>PDF · DOCX · TXT · MD · Images (OCR)</span>
         </label>
       </div>
     </div>

@@ -4,7 +4,8 @@ import { toast } from "sonner";
 import { Upload, FileText, GraduationCap, LogOut, CheckCircle2, AlertCircle, Loader2, Trash2, RefreshCw } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const ACCEPT = ".pdf,.docx,.txt,.md";
+const ACCEPT = ".pdf,.docx,.txt,.md,.png,.jpg,.jpeg,.webp,.tiff,.bmp";
+const ALLOWED_EXT = [".pdf",".docx",".txt",".md",".png",".jpg",".jpeg",".webp",".tiff",".bmp"];
 
 function fmtSize(n) {
   if (!n) return "";
@@ -75,8 +76,8 @@ export default function Onboarding({ user, onLogout, onComplete }) {
   const doUpload = async (file) => {
     if (!file) return;
     const ext = "." + (file.name.split(".").pop() || "").toLowerCase();
-    if (![".pdf", ".docx", ".txt", ".md"].includes(ext)) {
-      toast.error("Only PDF, DOCX, TXT, or MD files are supported");
+    if (!ALLOWED_EXT.includes(ext)) {
+      toast.error("Only PDF, DOCX, TXT, MD, PNG, JPG, JPEG, WEBP, TIFF, or BMP are supported");
       return;
     }
     if (file.size > 25 * 1024 * 1024) {
@@ -182,7 +183,7 @@ export default function Onboarding({ user, onLogout, onComplete }) {
           />
           <div className="upload-ic"><Upload size={22} /></div>
           <b>{uploading ? "Uploading…" : "Drop a file here or click to choose"}</b>
-          <small>PDF · DOCX · TXT · MD · up to 25 MB</small>
+          <small>PDF · DOCX · TXT · MD · PNG · JPG · WEBP (scanned docs & photos use built-in OCR) · up to 25 MB</small>
           {uploading && (
             <div className="progress-line" style={{ marginTop: 16 }}>
               <span style={{ width: `${progress}%` }} />

@@ -13,6 +13,9 @@ from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, Strea
 
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_bytes
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -26,7 +29,11 @@ APP_NAME = "lumina-academic"
 
 NOT_FOUND_MESSAGE = "I couldn't find this information in your uploaded materials. Please upload the relevant page or document."
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
-ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".md"}
+ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"}
+OCR_LANG = os.environ.get("OCR_LANG", "eng")
+OCR_PDF_DPI = int(os.environ.get("OCR_PDF_DPI", "200"))
+OCR_MAX_PAGES = int(os.environ.get("OCR_MAX_PAGES", "40"))
 
 app = FastAPI(title="Lumina Academic API")
 api = APIRouter(prefix="/api")
@@ -114,19 +121,50 @@ def delete_object(path: str) -> None:
 
 # ---------- extraction ----------
 
+def _ocr_image(img: Image.Image) -> str:
+    try:
+        if img.mode not in ("L", "RGB"):
+            img = img.convert("RGB")
+        text = pytesseract.image_to_string(img, lang=OCR_LANG)
+    except Exception as exc:
+        logging.exception("OCR failed")
+        raise ValueError(f"OCR failed: {exc}")
+    return normalize_text(text or "")
+
+
+def _ocr_pdf(data: bytes) -> List[dict]:
+    try:
+        images = convert_from_bytes(data, dpi=OCR_PDF_DPI, fmt="png")
+    except Exception as exc:
+        raise ValueError(f"Could not render PDF for OCR: {exc}")
+    pages: List[dict] = []
+    for i, img in enumerate(images[:OCR_MAX_PAGES], start=1):
+        text = _ocr_image(img)
+        if text:
+            pages.append({"page": i, "text": text})
+    return pages
+
+
 def extract_pages(filename: str, data: bytes) -> List[dict]:
     """Return [{page: int, text: str}, ...]. Raise ValueError on unsupported/empty."""
     suffix = Path(filename).suffix.lower()
     pages: List[dict] = []
     if suffix == ".pdf":
-        reader = PdfReader(io.BytesIO(data))
-        for i, page in enumerate(reader.pages, start=1):
-            try:
-                text = normalize_text(page.extract_text() or "")
-            except Exception:
-                text = ""
-            if text:
-                pages.append({"page": i, "text": text})
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            for i, page in enumerate(reader.pages, start=1):
+                try:
+                    text = normalize_text(page.extract_text() or "")
+                except Exception:
+                    text = ""
+                if text:
+                    pages.append({"page": i, "text": text})
+        except Exception as exc:
+            logging.warning("pypdf failed, will try OCR: %s", exc)
+            pages = []
+        # OCR fallback for scanned PDFs
+        if not pages:
+            pages = _ocr_pdf(data)
     elif suffix == ".docx":
         doc = DocxDocument(io.BytesIO(data))
         buf: List[str] = []
@@ -135,7 +173,6 @@ def extract_pages(filename: str, data: bytes) -> List[dict]:
             txt = (para.text or "").strip()
             if txt:
                 buf.append(txt)
-            # DOCX has no reliable page breaks; chunk every ~1800 chars into a logical "page"
             if sum(len(x) for x in buf) > 1800:
                 pages.append({"page": page_num, "text": normalize_text(" ".join(buf))})
                 buf = []
@@ -144,7 +181,6 @@ def extract_pages(filename: str, data: bytes) -> List[dict]:
             pages.append({"page": page_num, "text": normalize_text(" ".join(buf))})
     elif suffix in {".txt", ".md"}:
         text = data.decode("utf-8", errors="ignore")
-        # Chunk every ~1800 chars
         chunks = []
         chunk: List[str] = []
         size = 0
@@ -160,11 +196,19 @@ def extract_pages(filename: str, data: bytes) -> List[dict]:
         for i, c in enumerate(chunks, start=1):
             if normalize_text(c):
                 pages.append({"page": i, "text": normalize_text(c)})
+    elif suffix in IMAGE_EXTS:
+        try:
+            img = Image.open(io.BytesIO(data))
+        except Exception as exc:
+            raise ValueError(f"Could not open image: {exc}")
+        text = _ocr_image(img)
+        if text:
+            pages.append({"page": 1, "text": text})
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
 
     if not pages:
-        raise ValueError("No readable text was found. Scanned images are not supported — please upload a text-based PDF, DOCX, or TXT.")
+        raise ValueError("No readable text was found in this file. If it is a scanned document or photo, make sure the text is legible and try again.")
     return pages
 
 
@@ -323,7 +367,7 @@ async def process_and_persist(user_id: str, material_id: str, filename: str, dat
 async def upload_material(file: UploadFile = File(...), user: dict = Depends(current_user)):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXTS:
-        raise HTTPException(400, "Only PDF, DOCX, TXT, or MD files are supported.")
+        raise HTTPException(400, "Only PDF, DOCX, TXT, MD, or image files (PNG, JPG, JPEG, WEBP, TIFF, BMP) are supported.")
     data = await file.read()
     if not data:
         raise HTTPException(400, "The uploaded file is empty.")
