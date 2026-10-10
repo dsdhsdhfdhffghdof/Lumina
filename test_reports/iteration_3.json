@@ -1,0 +1,34 @@
+{
+  "summary": "Comprehensive backend regression suite created at /app/backend/tests/test_lumina_backend.py covering all 23 feature areas from the review request. All 27 tests pass (100% backend success). Covered: unauth 401s, invalid Google session_id 401, synthetic session + /auth/me 200, expired-session rejection, PDF/DOCX/TXT/MD upload success with DB persistence, unsupported ext (.exe/.zip/.png) 400, empty 400, >25MB 413, per-user material isolation on list/download/delete, retry reprocessing, grounded LLM answer with [filename, p.N] citation marker, exact NOT_FOUND_MESSAGE fallback for off-material and no-materials cases, user-scoped tutor history & dashboard, onboarding true/false, logout invalidation, CORS preflight with allow_credentials and reflected origin.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_lumina_backend.py",
+    "/app/test_reports/pytest/pytest_results_iteration3.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py line 242: set_cookie uses samesite='none' with secure=True which is correct for cross-site cookies, but local HTTP testing via cookies will fail — this is OK because Bearer header path is supported.",
+    "server.py is 597 lines in a single file; consider splitting into routers/modules (auth, materials, tutor, storage, extraction) when it grows past ~700 lines.",
+    "retrieve_pages() loads up to 400 pages into memory then scores in Python — fine for MVP but should move scoring/ranking to a proper index (e.g., Mongo text index or vector search) at scale.",
+    "process_and_persist stores full page text in Mongo; tokens list is also stored — consider dropping tokens from GET responses (already done) but a size cap per page would protect from runaway docs.",
+    "upload_material reads entire file into memory before size check — a user can send a huge body before the 413 is returned. Consider streaming + early reject via Content-Length header."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_lumina_backend.py"
+  ],
+  "success_rate": { "backend": "100%", "frontend": "N/A (backend-only review)" },
+  "test_credentials": "Google OAuth only; synthetic sessions minted directly into Mongo (users + user_sessions) per /app/memory/test_credentials.md",
+  "seed_data_creation": "Two per-run synthetic users (a-*@lumina-test.local, b-*@lumina-test.local) plus transient expired/logout users; all cleaned up on module teardown by filtering emails with @lumina-test.local suffix.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Use `pytest backend/tests/test_lumina_backend.py -o addopts=''` to run without xdist. xdist parallelism caused teardown races due to session cleanup — the fixture is now safe (scoped to users with @lumina-test.local emails) but single-worker is still recommended. Smoke test at backend/tests/smoke_tutor.py uses localhost:8001; new suite uses REACT_APP_BACKEND_URL (public).",
+  "rca of the issue": "N/A — no bugs found. All 23 required test scenarios pass against the public preview URL."
+}
