@@ -328,7 +328,11 @@ function Tutor({ user, materials }) {
 
   const ready = materials.filter((m) => m.status === "ready");
   const presetPrompts = ready.length
-    ? [`Summarize the key ideas in ${ready[0].filename}`, `What are the main concepts in page 1 of ${ready[0].filename}?`]
+    ? [
+        { label: "Summarize my materials", prompt: "Summarize the main concepts in my uploaded materials" },
+        { label: "Generate 5 practice questions", prompt: "Generate 5 practice questions from my materials, with answers and explanations" },
+        { label: `Key ideas in ${ready[0].filename}`, prompt: `What are the main concepts in ${ready[0].filename}?` },
+      ]
     : [];
 
   return (
@@ -352,10 +356,10 @@ function Tutor({ user, materials }) {
                     {presetPrompts.map((p, i) => (
                       <button
                         key={i}
-                        onClick={() => setDraft(p)}
+                        onClick={() => setDraft(p.prompt)}
                         data-testid={`prompt-${i}`}
                       >
-                        {p}
+                        {p.label}
                       </button>
                     ))}
                   </div>

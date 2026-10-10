@@ -487,30 +487,104 @@ async def onboarding_status(user: dict = Depends(current_user)):
 
 # ---------- retrieval + tutor ----------
 
-async def retrieve_pages(user_id: str, query: str, top_k: int = 5) -> List[dict]:
-    kws = keywords(query)
-    if not kws:
+BROAD_INTENT_WORDS = {
+    "summarize", "summarise", "summary", "overview", "outline", "recap",
+    "explain", "describe", "introduce", "introduction",
+    "questions", "quiz", "practice", "mcq", "problems", "exercises", "test",
+    "flashcards", "flashcard",
+    "main", "key", "important", "topics", "concepts", "ideas", "points",
+    "list", "generate", "create", "give", "all",
+}
+
+
+def _detect_intent(q_lower: str) -> str:
+    toks = set(tokenize(q_lower))
+    if toks & {"questions", "quiz", "practice", "mcq", "problems", "exercises", "flashcards", "flashcard"}:
+        return "questions"
+    if toks & {"summarize", "summarise", "summary", "overview", "outline", "recap"}:
+        return "summarize"
+    if (toks & {"main", "key", "important", "topics", "concepts", "ideas", "points", "list", "all"}) and (
+        toks & {"page", "pages", "chapter", "section", "document", "file", "material", "pdf", "unit", "topic"}
+    ):
+        return "summarize"
+    return "specific"
+
+
+def _mentioned_materials(mats: List[dict], q_lower: str) -> List[str]:
+    matched: List[str] = []
+    for m in mats:
+        fn = (m.get("filename") or "").lower()
+        if not fn:
+            continue
+        stem = fn.rsplit(".", 1)[0]
+        if fn in q_lower or (len(stem) >= 4 and stem in q_lower):
+            matched.append(m["material_id"])
+    return matched
+
+
+async def retrieve_pages(user_id: str, query: str, top_k: int = 6) -> List[dict]:
+    q_lower = (query or "").lower()
+    mats = await db.materials.find(
+        {"user_id": user_id, "is_deleted": {"$ne": True}, "status": "ready"},
+        {"_id": 0},
+    ).to_list(length=200)
+    if not mats:
         return []
-    cursor = db.material_pages.find({"user_id": user_id, "tokens": {"$in": kws}}, {"_id": 0, "tokens": 0}).limit(400)
-    pages = [p async for p in cursor]
-    if not pages:
-        return []
-    # score by overlap frequency
-    kw_set = set(kws)
-    scored = []
-    for p in pages:
-        text_tokens = tokenize(p["text"])
-        hits = sum(1 for t in text_tokens if t in kw_set)
-        scored.append((hits, p))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = [p for _, p in scored[:top_k]]
-    # attach filenames
-    ids = list({p["material_id"] for p in top})
-    mats = {m["material_id"]: m async for m in db.materials.find({"material_id": {"$in": ids}, "user_id": user_id}, {"_id": 0})}
-    for p in top:
-        m = mats.get(p["material_id"], {})
-        p["filename"] = m.get("filename", "Unknown")
-    return top
+    mat_name = {m["material_id"]: m.get("filename", "Unknown") for m in mats}
+    mentioned = _mentioned_materials(mats, q_lower)
+    intent = _detect_intent(q_lower)
+
+    # Page number mention: "page N", "p. N", "pg N"
+    page_match = re.search(r"\b(?:page|pg|p\.?)\s*(\d{1,4})\b", q_lower)
+    target_page = int(page_match.group(1)) if page_match else None
+
+    selected: List[dict] = []
+
+    # 1) If the user explicitly names a file and/or page, return those exact pages.
+    if mentioned:
+        q: dict = {"user_id": user_id, "material_id": {"$in": mentioned}}
+        if target_page is not None:
+            q["page_number"] = target_page
+        cursor = db.material_pages.find(q, {"_id": 0, "tokens": 0}).sort("page_number", 1).limit(max(top_k, 12))
+        selected = [p async for p in cursor]
+
+    # 2) Keyword retrieval over the (optionally filtered) pool.
+    if not selected:
+        kws = keywords(query)
+        scoped: dict = {"user_id": user_id}
+        if mentioned:
+            scoped["material_id"] = {"$in": mentioned}
+        if kws:
+            scoped["tokens"] = {"$in": kws}
+            cursor = db.material_pages.find(scoped, {"_id": 0, "tokens": 0}).limit(500)
+            pool = [p async for p in cursor]
+            if pool:
+                kw_set = set(kws)
+                scored = sorted(
+                    ((sum(1 for t in tokenize(p["text"]) if t in kw_set), p) for p in pool),
+                    key=lambda x: x[0], reverse=True,
+                )
+                selected = [p for _, p in scored[:top_k]]
+
+    # 3) Broad intent (summarize / questions / overview) or empty retrieval: fetch top pages of the (named or all) materials.
+    if (not selected) or intent in ("summarize", "questions"):
+        q = {"user_id": user_id}
+        if mentioned:
+            q["material_id"] = {"$in": mentioned}
+        cursor = db.material_pages.find(q, {"_id": 0, "tokens": 0}).sort([("material_id", 1), ("page_number", 1)]).limit(12)
+        pool = [p async for p in cursor]
+        if pool:
+            # Merge with any keyword-selected pages (dedupe by page_id)
+            seen = {p["page_id"] for p in selected}
+            for p in pool:
+                if p["page_id"] not in seen:
+                    selected.append(p)
+                    seen.add(p["page_id"])
+            selected = selected[:max(top_k, 8)]
+
+    for p in selected:
+        p["filename"] = mat_name.get(p["material_id"], "Unknown")
+    return selected
 
 
 class ChatInput(BaseModel):
@@ -522,12 +596,24 @@ async def llm_grounded_answer(prompt: str, session_id: str) -> str:
     if not key:
         raise HTTPException(500, "LLM key is not configured")
     system = (
-        "You are Lumina, a careful source-grounded study tutor. "
-        "You MUST answer ONLY using the provided Excerpts from the student's uploaded materials. "
-        "Do not use outside knowledge. Do not invent facts, references, page numbers, or filenames. "
-        "Every factual claim must be followed inline by a citation like [Filename, p.N] exactly as given in the Excerpts. "
-        "After the explanation, add a line beginning with 'Evidence:' listing each citation used. "
-        f"If the Excerpts do not contain enough information to answer, respond with EXACTLY this sentence and nothing else: {NOT_FOUND_MESSAGE}"
+        "You are Lumina, an expert, patient study tutor. You answer ONLY from the Excerpts the student provides "
+        "(from their own uploaded textbooks, slides, scans, and notes). Follow these rules strictly:\n"
+        "1. GROUNDING: Do not use outside knowledge. Do not invent facts, references, page numbers, filenames, or formulas. "
+        "Every substantive claim must be followed inline by a citation of the form [Filename, p.N], using ONLY the exact "
+        "Filename and page numbers that appear in the Excerpts. If the Excerpts truly do not contain the information "
+        f"needed to answer, respond with EXACTLY this sentence and nothing else: {NOT_FOUND_MESSAGE}\n"
+        "2. OCR + MATH: The Excerpts may come from OCR of scans and may contain typos, missing symbols, or jumbled "
+        "math. Infer the student's intended meaning from context, reconstruct equations using plain math notation "
+        "(e.g. x^2, sqrt(x), (a+b)/c, integral from 0 to 1, sum, dy/dx), and define any symbols you use. If OCR is too "
+        "garbled to interpret a particular formula, say so and point to the page citation.\n"
+        "3. PEDAGOGY: Be concise and clear. Use short paragraphs, bullet lists, or numbered steps when they help. "
+        "For math or multi-step problems, show the solution step-by-step and justify each step with a citation.\n"
+        "4. SUMMARIES: When asked to summarize, give an organized outline of the main concepts, each line cited.\n"
+        "5. QUESTIONS / QUIZZES: When asked to generate practice questions, output a numbered list. For each question "
+        "include: the question text, (if MCQ) 4 options labelled A-D, the correct answer, a 1-sentence explanation, "
+        "and the [Filename, p.N] citation for where the answer comes from.\n"
+        "6. FORMAT: After the main answer, add a line that starts with 'Evidence:' listing the distinct citations used, "
+        "separated by commas. Do not add citations that do not appear in the Excerpts."
     )
     chat = LlmChat(api_key=key, session_id=session_id, system_message=system).with_model("gemini", "gemini-3.1-pro-preview")
     chunks: List[str] = []
@@ -553,22 +639,41 @@ async def tutor_chat(payload: ChatInput, user: dict = Depends(current_user)):
             "sources_available": 0,
         }
 
-    pages = await retrieve_pages(user["user_id"], question, top_k=5)
+    pages = await retrieve_pages(user["user_id"], question, top_k=6)
     if not pages:
         answer = NOT_FOUND_MESSAGE
         record = {"id": uuid.uuid4().hex, "user_id": user["user_id"], "role": "assistant", "question": question, "answer": answer, "citations": [], "grounded": False, "created_at": now_iso()}
         await db.chat_messages.insert_one(record)
         return {"answer": answer, "citations": [], "grounded": False, "sources_available": ready_count}
 
+    intent = _detect_intent(question.lower())
     excerpts_text = "\n\n".join(
-        f"[{p['filename']}, p.{p['page_number']}]\n{p['text'][:1200]}" for p in pages
+        f"[{p['filename']}, p.{p['page_number']}]\n{p['text'][:1800]}" for p in pages
     )
+    task_hint = {
+        "summarize": (
+            "The student wants a summary / overview. Produce an organized outline of the main concepts, "
+            "formulas, and definitions found in the Excerpts. Use short bullets. Cite each bullet with "
+            "[Filename, p.N]."
+        ),
+        "questions": (
+            "The student wants practice questions. Generate 5 varied practice questions from the Excerpts "
+            "(mix of multiple-choice with 4 options A-D, short-answer, and if the material contains math, "
+            "at least one numerical/problem-solving question). For every question, provide the correct "
+            "answer, a 1-sentence explanation, and a [Filename, p.N] citation."
+        ),
+        "specific": (
+            "Answer the student's question directly and clearly, step-by-step when it is a math or multi-step "
+            "problem. Keep every claim grounded in the Excerpts and cited."
+        ),
+    }[intent]
     prompt = (
-        f"Student question: {question}\n\n"
-        f"Excerpts from the student's uploaded materials (use ONLY these):\n{excerpts_text}\n\n"
-        "Write a concise explanation grounded in these excerpts. Cite inline like [Filename, p.N]. "
-        "Finish with an 'Evidence:' line listing citations. "
-        f"If the excerpts do not contain enough information, reply with exactly: {NOT_FOUND_MESSAGE}"
+        f"Student request: {question}\n\n"
+        f"Task hint: {task_hint}\n\n"
+        f"Excerpts from the student's uploaded materials (use ONLY these; they may contain OCR noise — "
+        f"interpret math and formulas thoughtfully):\n{excerpts_text}\n\n"
+        "Write your response following the system rules. Finish with an 'Evidence:' line listing citations. "
+        f"If the Excerpts do not contain enough information, reply with exactly: {NOT_FOUND_MESSAGE}"
     )
     try:
         answer = await llm_grounded_answer(prompt, f"user-{user['user_id']}")
