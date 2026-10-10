@@ -1,0 +1,37 @@
+{
+  "summary": "Validated self-hosted Tesseract OCR integration end-to-end. Added /app/backend/tests/test_ocr_backend.py with 14 new tests covering: scanned PDF OCR fallback (reportlab+ImageReader+Pillow, no text layer) persists OCR'd pages with matching words; PNG and JPEG image uploads OCR to ready; blank 100x100 image fails gracefully with error and keeps material row for retry; .gif rejected 400; text-PDF/DOCX/TXT/MD still ready; tutor returns grounded=true with [scanned.pdf, p.1] citation for 'What do ribosomes do?'; tutor returns grounded=true with [ocean.png, p.1] citation for image-only user; off-material question returns EXACT NOT_FOUND_MESSAGE; cross-user isolation on OCR'd PDF (user_b download/delete -> 404); DELETE on OCR'd scanned PDF removes material_pages and excludes from list. Also updated obsolete regression test (test_unsupported_png_400 -> test_unsupported_gif_400) since PNG is now a valid OCR extension. Combined suite: 41/41 passing (14 OCR + 27 regression).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_ocr_backend.py",
+    "/app/backend/tests/test_lumina_backend.py",
+    "/app/test_reports/pytest/ocr_results.xml",
+    "/app/test_reports/pytest/all_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py _ocr_pdf silently truncates at OCR_MAX_PAGES=40 without surfacing a warning in the material row; a scanned PDF with 50 pages will store only 40 pages and the user has no indication. Consider adding a 'truncated: true' field on materials when len(images) > OCR_MAX_PAGES.",
+    "process_and_persist does not catch generic Exception from _ocr_pdf (only ValueError in extract_pages). pdf2image can raise PDFPageCountError or PDFSyntaxError that are NOT ValueError and would currently bubble up as a 500. Suggest wrapping convert_from_bytes failures as ValueError (already done) but also catching pytesseract.TesseractError in _ocr_image.",
+    "OCR runs synchronously in the request handler (await upload_material blocks the event loop during pytesseract.image_to_string which is CPU-bound). Consider running OCR in a thread executor (asyncio.to_thread) so other requests are not stalled during long OCR jobs.",
+    "server.py still 640+ lines in a single file; splitting into routers (auth, materials, ocr/extraction, tutor) remains advisable.",
+    "No test for OCR_MAX_PAGES boundary — if a user uploads a 50-page scanned PDF only 40 pages are indexed silently."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_ocr_backend.py",
+    "/app/backend/tests/test_lumina_backend.py"
+  ],
+  "success_rate": { "backend": "100% (41/41)", "frontend": "N/A (backend-only)" },
+  "test_credentials": "Google OAuth only; synthetic sessions minted in Mongo (emails @lumina-ocr-test.local for OCR suite, @lumina-test.local for regression).",
+  "seed_data_creation": "Two per-run synthetic users per suite with transient sessions; all users+sessions+materials+material_pages+chat_messages cleaned up on module teardown by matching the test email suffixes.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Run: `cd /app && python -m pytest backend/tests/test_ocr_backend.py backend/tests/test_lumina_backend.py -o addopts=''`. OCR takes ~15s total for the whole OCR suite at 200 DPI; httpx timeout=180s is used. Tesseract 5.3 is at /usr/bin/tesseract, Poppler at /usr/bin/pdftoppm. OCR_LANG=eng, OCR_PDF_DPI=200, OCR_MAX_PAGES=40. The obsolete test_unsupported_png_400 was renamed to test_unsupported_gif_400 because PNG is now in ALLOWED_EXTS.",
+  "rca of the issue": "N/A — OCR integration works correctly for scanned PDFs, PNG, JPEG, and image fallback with proper tutor citations and exact NOT_FOUND_MESSAGE preserved."
+}

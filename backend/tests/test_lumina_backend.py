@@ -206,9 +206,10 @@ class TestUploadValidation:
                       headers=auth(user_a))
         assert r.status_code == 400
 
-    def test_unsupported_png_400(self, http, user_a):
+    def test_unsupported_gif_400(self, http, user_a):
+        # PNG/JPG/WEBP/TIFF/BMP are now accepted (OCR path); GIF is still rejected.
         r = http.post("/materials/upload",
-                      files={"file": ("a.png", b"\x89PNG\r\n", "image/png")},
+                      files={"file": ("a.gif", b"GIF89a\x00\x00", "image/gif")},
                       headers=auth(user_a))
         assert r.status_code == 400
 
