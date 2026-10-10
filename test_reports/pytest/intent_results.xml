@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="9" time="89.204" timestamp="2026-10-10T06:44:02.167828+00:00" hostname="agent-env-951e9b72-9f30-48a7-95d5-237a10edb182"><testcase classname="tests.test_intent_retrieval" name="test_user_reported_query_grounded_with_citation" time="13.280" /><testcase classname="tests.test_intent_retrieval" name="test_summarize_intent_multi_citation" time="12.026" /><testcase classname="tests.test_intent_retrieval" name="test_question_generation_intent" time="15.658"><failure message="AssertionError: Expected &gt;=3 numbered questions, got: Here are 5 practice questions based on your study materials:&#10;  &#10;  **1. Multiple Choice: Discriminant Rules**&#10;  What type of roots does a quadratic equation have if its discriminant ($D$) is less than 0?&#10;  A) One real root&#10;  B) Two real roots&#10;  C) Two complex roots&#10;  D) Infinite roots&#10;  *Correct Answer:* C&#10;  *Explanation:* According to the rules of the discriminant, if $D &lt; 0$, the quadratic equation has two complex&#10;assert 0 &gt;= 3&#10; +  where 0 = len([])">backend/tests/test_intent_retrieval.py:241: in test_question_generation_intent
+    assert len(numbered) &gt;= 3, f"Expected &gt;=3 numbered questions, got: {ans[:400]}"
+E   AssertionError: Expected &gt;=3 numbered questions, got: Here are 5 practice questions based on your study materials:
+E     
+E     **1. Multiple Choice: Discriminant Rules**
+E     What type of roots does a quadratic equation have if its discriminant ($D$) is less than 0?
+E     A) One real root
+E     B) Two real roots
+E     C) Two complex roots
+E     D) Infinite roots
+E     *Correct Answer:* C
+E     *Explanation:* According to the rules of the discriminant, if $D &lt; 0$, the quadratic equation has two complex
+E   assert 0 &gt;= 3
+E    +  where 0 = len([])</failure></testcase><testcase classname="tests.test_intent_retrieval" name="test_specific_math_problem" time="13.866" /><testcase classname="tests.test_intent_retrieval" name="test_page_specific_query_targets_page_2" time="11.811" /><testcase classname="tests.test_intent_retrieval" name="test_filename_only_query_no_keyword_overlap" time="12.165" /><testcase classname="tests.test_intent_retrieval" name="test_off_material_question_returns_exact_fallback" time="4.411" /><testcase classname="tests.test_intent_retrieval" name="test_no_materials_user_gets_exact_fallback" time="0.044" /><testcase classname="tests.test_intent_retrieval" name="test_cross_user_isolation_summarize" time="5.716" /></testsuite></testsuites>

@@ -1,0 +1,36 @@
+{
+  "summary": "Validated the new filename-aware / page-aware / intent-aware retrieval fix end-to-end against localhost:8001/api. Added /app/backend/tests/test_intent_retrieval.py with 9 new pytest tests exercising: (1) the exact failing user query 'What are the main concepts in page 1 of EXAMWIZARD STUDY MATERIAL UNIT 1 TOPIC 3.pdf?' now returns grounded=true with a [EXAMWIZARD... UNIT 1 TOPIC 3.pdf, p.1] citation marker and non-empty citations list referencing page 1; (2) 'Summarize my materials' intent returns grounded=true with multiple citations and an organized outline; (3) 'Generate 5 practice questions...' returns grounded=true with >=3 numbered items (model emits '**1.' markdown style) and at least one [filename, p.N] citation; (4) 'Solve 2x^2 - 4x - 6 = 0' returns grounded=true with citations; (5) 'summarize page 2' retrieves page 2 citations; (6) 'tell me about <filename.pdf>' succeeds even without keyword overlap; (7) 'What is the capital of France?' returns the EXACT NOT_FOUND_MESSAGE string with grounded=false; (8) user with no materials gets the exact fallback and sources_available=0; (9) cross-user isolation holds (user B 'summarize my materials' never cites user A's EXAMWIZARD file). Also re-ran the full regression (test_lumina_backend.py 27 + test_ocr_backend.py 14) — 50/50 passing in 119s. Verbatim fallback is preserved.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_intent_retrieval.py",
+    "/app/backend/tests/test_lumina_backend.py",
+    "/app/backend/tests/test_ocr_backend.py",
+    "/app/test_reports/pytest/all_results_iter5.xml",
+    "/app/test_reports/pytest/intent_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py _detect_intent returns 'summarize' when a query combines a generic word (main/key/important/topics) AND a scope word (page/pdf/unit...). This is correct and triggers the broad-pool retrieval, but note that purely-filename queries with no scope/generic words still go through branch (1) via _mentioned_materials (works via the mentioned-filter in retrieve_pages). Consider promoting intent to 'summarize' whenever only a filename is mentioned so that top-K pages of that file are preferred, which already happens in practice because branch (1) returns all pages of the file sorted by page_number — fine.",
+    "retrieve_pages branch (1) returns up to max(top_k, 12) pages when only a filename is mentioned; for very large PDFs (dozens of pages) this is only the first ~12 pages. For 'summarize <filename>' intent this is acceptable; consider striding across the doc instead of first-N for larger PDFs.",
+    "In llm_grounded_answer the stronger system prompt relies on model obedience for the exact fallback string. The guardrail at tutor_chat (if not cited and NOT_FOUND_MESSAGE not in answer -> replace) is the real safety net and works correctly in all tested paths.",
+    "Prior comments still apply: server.py is 740+ lines (should split into routers), OCR runs on the request thread, OCR_MAX_PAGES=40 silently truncates."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_intent_retrieval.py (new)"
+  ],
+  "success_rate": {"backend": "100% (50/50)", "frontend": "N/A (backend-only)"},
+  "test_credentials": "Google OAuth only; synthetic sessions minted directly in Mongo (emails suffixed @lumina-intent-test.local for the new suite).",
+  "seed_data_creation": "Per-run synthetic users (a-*, b-*, c-*) with 2h sessions; materials/material_pages/chat_messages for those users; all rows removed in module teardown by email suffix.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Run full regression with: `cd /app && python -m pytest backend/tests/test_lumina_backend.py backend/tests/test_ocr_backend.py backend/tests/test_intent_retrieval.py -o addopts=''`. Takes ~120s total (LLM calls dominate). httpx timeout=180s. The new suite depends on EMERGENT_LLM_KEY and the Gemini backend behind llm_grounded_answer. The question-generation test matches numbered items as '**N.' OR 'N.' OR 'N)' because the current model emits markdown-bolded numbering.",
+  "rca of the issue": "Original bug: retrieval was keyword-only, so 'main concepts in page 1 of <filename>' shared no tokens with page text ('ax^2', 'discriminant', ...) and returned 0 pages, triggering the fallback. Fix adds (a) _mentioned_materials to map filename stems appearing in the query to material_ids, (b) explicit page-number regex ('page N'/'p. N'/'pg N') to filter to the exact page, (c) _detect_intent to recognize 'summarize'/'questions'/broad concept queries and widen the retrieval pool to top pages of the (optionally filename-filtered) material set, and (d) a stronger system prompt + task_hint per intent. Validated: the exact failing query now returns grounded=true with [EXAMWIZARD STUDY MATERIAL UNIT 1 TOPIC 3.pdf, p.1] citation, and the guardrail still forces NOT_FOUND for genuinely off-material queries."
+}
