@@ -1,14 +1,18 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request, Response
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Any, List
-import os, uuid, json, logging, requests
+from typing import Any, List, Optional
+import os, uuid, io, re, logging, requests, mimetypes
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+
+from pypdf import PdfReader
+from docx import Document as DocxDocument
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -17,58 +21,47 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
 STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
-STORAGE_KEY = None
+STORAGE_KEY: Optional[str] = None
 APP_NAME = "lumina-academic"
+
+NOT_FOUND_MESSAGE = "I couldn't find this information in your uploaded materials. Please upload the relevant page or document."
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".md"}
 
 app = FastAPI(title="Lumina Academic API")
 api = APIRouter(prefix="/api")
 
-TOPICS = [
-    {"id": "t1", "name": "Cellular respiration", "detail": "How cells convert glucose into usable energy", "mastery": 74, "color": "terracotta", "prerequisite": "Cell structure"},
-    {"id": "t2", "name": "Glycolysis", "detail": "The ten-step pathway that begins glucose breakdown", "mastery": 61, "color": "ochre", "prerequisite": "Cellular respiration"},
-    {"id": "t3", "name": "Krebs cycle", "detail": "Carbon oxidation and electron carrier production", "mastery": 82, "color": "forest", "prerequisite": "Acetyl-CoA"},
-    {"id": "t4", "name": "Electron transport chain", "detail": "A proton gradient powers ATP synthase", "mastery": 48, "color": "rose", "prerequisite": "Redox reactions"},
-]
-SOURCES = [
-    {"id": "s1", "name": "Week 04 · Cellular Respiration.pdf", "type": "PDF", "meta": "24 pages · processed", "status": "Ready", "accent": "terracotta", "topics": 4},
-    {"id": "s2", "name": "Mitochondria & ATP · Lecture 04.pptx", "type": "SLIDES", "meta": "18 slides · diagrams extracted", "status": "Ready", "accent": "forest", "topics": 3},
-    {"id": "s3", "name": "Office hours · 14:32 recording.mp4", "type": "VIDEO", "meta": "42:18 · transcript indexed", "status": "Ready", "accent": "ochre", "topics": 5},
-]
-EXCERPTS = [
-    {"id": "e1", "source_id": "s1", "title": "The purpose of respiration", "quote": "Cellular respiration is the controlled release of energy from organic molecules, usually glucose, to make ATP.", "location": "Page 3", "topic": "Cellular respiration"},
-    {"id": "e2", "source_id": "s2", "title": "The proton gradient", "quote": "As electrons move through the electron transport chain, protons are pumped into the intermembrane space.", "location": "Slide 12", "topic": "Electron transport chain"},
-    {"id": "e3", "source_id": "s3", "title": "A useful distinction", "quote": "Glycolysis does not require oxygen; oxygen becomes important when the electron carriers are re-oxidized later.", "location": "14:32", "topic": "Glycolysis"},
-]
 
-class ChatInput(BaseModel):
-    message: str
-    history: List[dict] = []
+# ---------- helpers ----------
 
-class QuizSubmit(BaseModel):
-    question_id: str
-    answer: str
-
-class AuthSession(BaseModel):
-    session_id: str
-
-def now():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-async def llm_answer(prompt: str, session: str) -> str:
-    key = os.environ.get("EMERGENT_LLM_KEY")
-    if not key:
-        raise HTTPException(500, "LLM key is not configured")
-    chat = LlmChat(api_key=key, session_id=session, system_message="You are Lumina, a careful course tutor. Only make source-backed claims from the provided excerpts. If the excerpts do not answer the question, say MATERIAL NOT COVERED. Keep answers concise and cite [source, location].")
-    chat = chat.with_model("gemini", "gemini-3.1-pro-preview")
-    chunks = []
-    async for event in chat.stream_message(UserMessage(text=prompt)):
-        if isinstance(event, TextDelta):
-            chunks.append(event.content)
-        elif isinstance(event, StreamDone):
-            break
-    return "".join(chunks).strip()
 
-def init_storage(force=False):
+def normalize_text(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip()
+
+
+def tokenize(t: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (t or "").lower())
+
+
+STOPWORDS = {
+    "the","a","an","and","or","of","to","in","on","for","is","are","was","were","be","been",
+    "being","it","its","this","that","these","those","as","at","by","with","from","but","not",
+    "what","which","who","whom","how","why","when","where","do","does","did","can","could",
+    "should","would","will","shall","i","you","he","she","we","they","my","your","their",
+    "me","him","her","us","them","so","if","then","than","there","here","about","into",
+}
+
+
+def keywords(q: str) -> List[str]:
+    return [w for w in tokenize(q) if w not in STOPWORDS and len(w) > 2]
+
+
+# ---------- storage ----------
+
+def init_storage(force: bool = False) -> str:
     global STORAGE_KEY
     if STORAGE_KEY and not force:
         return STORAGE_KEY
@@ -77,20 +70,111 @@ def init_storage(force=False):
     STORAGE_KEY = response.json()["storage_key"]
     return STORAGE_KEY
 
-def put_object(path, data, content_type):
-    key = init_storage()
-    response = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    if response.status_code == 404:
-        key = init_storage(force=True)
-        response = requests.put(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    response.raise_for_status()
-    return response.json()
 
-@api.get("/")
-async def root():
-    return {"message": "Lumina Academic API"}
+def _storage_request(method: str, path: str, *, data=None, content_type: Optional[str] = None, max_attempts: int = 3):
+    url = f"{STORAGE_URL}/objects/{path}"
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        key = init_storage(force=(attempt > 0))
+        headers = {"X-Storage-Key": key}
+        if content_type:
+            headers["Content-Type"] = content_type
+        try:
+            r = requests.request(method, url, headers=headers, data=data, timeout=120)
+        except requests.RequestException as exc:
+            last_exc = exc
+            continue
+        if r.status_code < 400:
+            return r
+        if r.status_code in (401, 403, 404, 429) or 500 <= r.status_code < 600:
+            last_exc = requests.HTTPError(f"{r.status_code} {r.text[:200]}", response=r)
+            continue
+        r.raise_for_status()
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Storage request failed with no response")
 
-async def current_user(request: Request):
+
+def put_object(path: str, data: bytes, content_type: str) -> dict:
+    r = _storage_request("PUT", path, data=data, content_type=content_type)
+    return r.json()
+
+
+def get_object(path: str) -> bytes:
+    r = _storage_request("GET", path)
+    return r.content
+
+
+def delete_object(path: str) -> None:
+    try:
+        _storage_request("DELETE", path, max_attempts=2)
+    except Exception:
+        logging.warning("Storage delete failed for %s", path)
+
+
+# ---------- extraction ----------
+
+def extract_pages(filename: str, data: bytes) -> List[dict]:
+    """Return [{page: int, text: str}, ...]. Raise ValueError on unsupported/empty."""
+    suffix = Path(filename).suffix.lower()
+    pages: List[dict] = []
+    if suffix == ".pdf":
+        reader = PdfReader(io.BytesIO(data))
+        for i, page in enumerate(reader.pages, start=1):
+            try:
+                text = normalize_text(page.extract_text() or "")
+            except Exception:
+                text = ""
+            if text:
+                pages.append({"page": i, "text": text})
+    elif suffix == ".docx":
+        doc = DocxDocument(io.BytesIO(data))
+        buf: List[str] = []
+        page_num = 1
+        for para in doc.paragraphs:
+            txt = (para.text or "").strip()
+            if txt:
+                buf.append(txt)
+            # DOCX has no reliable page breaks; chunk every ~1800 chars into a logical "page"
+            if sum(len(x) for x in buf) > 1800:
+                pages.append({"page": page_num, "text": normalize_text(" ".join(buf))})
+                buf = []
+                page_num += 1
+        if buf:
+            pages.append({"page": page_num, "text": normalize_text(" ".join(buf))})
+    elif suffix in {".txt", ".md"}:
+        text = data.decode("utf-8", errors="ignore")
+        # Chunk every ~1800 chars
+        chunks = []
+        chunk: List[str] = []
+        size = 0
+        for line in text.splitlines():
+            chunk.append(line)
+            size += len(line) + 1
+            if size > 1800:
+                chunks.append("\n".join(chunk))
+                chunk = []
+                size = 0
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for i, c in enumerate(chunks, start=1):
+            if normalize_text(c):
+                pages.append({"page": i, "text": normalize_text(c)})
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
+
+    if not pages:
+        raise ValueError("No readable text was found. Scanned images are not supported — please upload a text-based PDF, DOCX, or TXT.")
+    return pages
+
+
+# ---------- auth ----------
+
+class AuthSession(BaseModel):
+    session_id: str
+
+
+async def current_user(request: Request) -> dict:
     token = request.cookies.get("session_token")
     if not token:
         auth = request.headers.get("Authorization", "")
@@ -110,100 +194,402 @@ async def current_user(request: Request):
         raise HTTPException(401, "User not found")
     return user
 
+
 @api.post("/auth/session")
-async def create_session(input: AuthSession, response: Response):
+async def create_session(payload: AuthSession, response: Response):
     try:
-        result = requests.get("https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data", headers={"X-Session-ID": input.session_id}, timeout=30)
+        result = requests.get(
+            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+            headers={"X-Session-ID": payload.session_id},
+            timeout=30,
+        )
         result.raise_for_status()
         identity = result.json()
     except requests.RequestException:
         raise HTTPException(401, "Google session could not be verified")
+
     user = await db.users.find_one({"email": identity["email"]}, {"_id": 0})
-    timestamp = now()
+    ts = now_iso()
     if user:
         user_id = user["user_id"]
-        await db.users.update_one({"user_id": user_id}, {"$set": {"name": identity["name"], "picture": identity.get("picture", ""), "last_sign_in_at": timestamp}})
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": identity["name"], "picture": identity.get("picture", ""), "last_sign_in_at": ts}},
+        )
     else:
         user_id = "user_" + uuid.uuid4().hex[:12]
-        user = {"user_id": user_id, "google_id": identity["id"], "email": identity["email"], "name": identity["name"], "picture": identity.get("picture", ""), "created_at": timestamp, "first_sign_in_at": timestamp, "last_sign_in_at": timestamp, "learner_profile": {"level": "new", "preferred_language": "English"}, "course_progress": {}, "mastery": {}, "chat_history": []}
+        user = {
+            "user_id": user_id,
+            "google_id": identity.get("id", ""),
+            "email": identity["email"],
+            "name": identity["name"],
+            "picture": identity.get("picture", ""),
+            "created_at": ts,
+            "first_sign_in_at": ts,
+            "last_sign_in_at": ts,
+            "onboarded": False,
+            "preferred_language": "English",
+        }
         await db.users.insert_one(user)
-    expires = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
     expires_at = (datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=7)).isoformat()
-    await db.user_sessions.insert_one({"user_id": user_id, "session_token": identity["session_token"], "created_at": expires, "expires_at": expires_at})
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": identity["session_token"],
+        "created_at": ts,
+        "expires_at": expires_at,
+    })
     response.set_cookie("session_token", identity["session_token"], max_age=604800, httponly=True, secure=True, samesite="none", path="/")
     saved = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return saved
 
+
 @api.get("/auth/me")
-async def me(request: Request):
-    return await current_user(request)
+async def me(user: dict = Depends(current_user)):
+    return user
+
 
 @api.post("/auth/logout")
 async def logout(request: Request, response: Response):
     token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else None
     if token:
         await db.user_sessions.delete_many({"session_token": token})
     response.delete_cookie("session_token", path="/")
     return {"ok": True}
 
-@api.get("/dashboard")
-async def dashboard():
-    return {"topics": TOPICS, "sources": SOURCES, "excerpts": EXCERPTS, "streak": 6, "minutes": 184, "questions": 28, "confidence": 72}
 
-@api.get("/sources")
-async def sources():
-    return SOURCES
+# ---------- materials ----------
 
-@api.post("/sources/upload")
-async def upload_source(file: UploadFile = File(...)):
-    allowed = {".pdf", ".pptx", ".mp4", ".mov", ".mpg", ".avi", ".ppt"}
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in allowed:
-        raise HTTPException(400, "Upload a PDF, PowerPoint, or video file")
-    source_id = "s" + uuid.uuid4().hex[:8]
-    file_bytes = await file.read()
-    storage_path = f"{APP_NAME}/uploads/course/{source_id}{suffix}"
+def material_public(doc: dict) -> dict:
+    return {
+        "id": doc["material_id"],
+        "filename": doc["filename"],
+        "type": doc.get("ext", "").replace(".", "").upper() or "FILE",
+        "size": doc.get("size", 0),
+        "page_count": doc.get("page_count", 0),
+        "status": doc.get("status", "processing"),
+        "error": doc.get("error"),
+        "created_at": doc.get("created_at"),
+    }
+
+
+async def process_and_persist(user_id: str, material_id: str, filename: str, data: bytes, ext: str, content_type: str) -> dict:
+    storage_path = f"{APP_NAME}/users/{user_id}/materials/{material_id}{ext}"
+    storage_result = put_object(storage_path, data, content_type or "application/octet-stream")
     try:
-        storage_result = put_object(storage_path, file_bytes, file.content_type or "application/octet-stream")
+        pages = extract_pages(filename, data)
+    except ValueError as exc:
+        await db.materials.update_one(
+            {"material_id": material_id, "user_id": user_id},
+            {"$set": {"status": "failed", "error": str(exc), "storage_path": storage_result["path"], "size": storage_result.get("size", len(data))}},
+        )
+        return {"status": "failed", "error": str(exc)}
+
+    # Replace any previous page records (retry case)
+    await db.material_pages.delete_many({"material_id": material_id, "user_id": user_id})
+    docs = []
+    for p in pages:
+        docs.append({
+            "page_id": uuid.uuid4().hex,
+            "material_id": material_id,
+            "user_id": user_id,
+            "page_number": p["page"],
+            "text": p["text"],
+            "tokens": tokenize(p["text"]),
+            "created_at": now_iso(),
+        })
+    if docs:
+        await db.material_pages.insert_many(docs)
+
+    await db.materials.update_one(
+        {"material_id": material_id, "user_id": user_id},
+        {"$set": {
+            "status": "ready",
+            "error": None,
+            "page_count": len(pages),
+            "storage_path": storage_result["path"],
+            "size": storage_result.get("size", len(data)),
+            "processed_at": now_iso(),
+        }},
+    )
+    await db.users.update_one({"user_id": user_id}, {"$set": {"onboarded": True, "onboarded_at": now_iso()}})
+    return {"status": "ready", "page_count": len(pages)}
+
+
+@api.post("/materials/upload")
+async def upload_material(file: UploadFile = File(...), user: dict = Depends(current_user)):
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(400, "Only PDF, DOCX, TXT, or MD files are supported.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "The uploaded file is empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File is larger than {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    material_id = "m_" + uuid.uuid4().hex[:12]
+    doc = {
+        "material_id": material_id,
+        "user_id": user["user_id"],
+        "filename": file.filename,
+        "ext": ext,
+        "content_type": file.content_type or "application/octet-stream",
+        "size": len(data),
+        "status": "processing",
+        "error": None,
+        "page_count": 0,
+        "storage_path": None,
+        "is_deleted": False,
+        "created_at": now_iso(),
+    }
+    await db.materials.insert_one(doc)
+
+    try:
+        await process_and_persist(user["user_id"], material_id, file.filename, data, ext, file.content_type or "application/octet-stream")
     except requests.RequestException as exc:
-        logging.exception("Object storage upload failed")
-        raise HTTPException(502, f"Source storage is unavailable: {exc}")
-    source = {"id": source_id, "name": file.filename, "type": suffix.replace(".", "").upper(), "meta": "Queued · multimodal extraction", "status": "Processing", "accent": "terracotta", "topics": 0}
-    await db.sources.insert_one({**source, "storage_path": storage_result["path"], "size": storage_result["size"], "is_deleted": False, "created_at": now()})
-    return source
+        logging.exception("Object storage failed")
+        await db.materials.update_one(
+            {"material_id": material_id, "user_id": user["user_id"]},
+            {"$set": {"status": "failed", "error": f"Storage error: {exc}"}},
+        )
 
-@api.post("/chat")
-async def chat(input: ChatInput):
-    context = "\n".join(f"- {x['quote']} [{x['title']}, {x['location']}]" for x in EXCERPTS)
-    prompt = f"Course excerpts:\n{context}\n\nStudent question: {input.message}\nAnswer with a clear explanation, then a short 'Evidence' line with the exact citations. Separate any unsupported claim as outside course material."
-    answer = await llm_answer(prompt, "lumina-chat-" + uuid.uuid4().hex)
-    record = {"id": uuid.uuid4().hex, "role": "assistant", "message": answer, "question": input.message, "created_at": now()}
+    saved = await db.materials.find_one({"material_id": material_id, "user_id": user["user_id"]}, {"_id": 0})
+    return material_public(saved)
+
+
+@api.get("/materials")
+async def list_materials(user: dict = Depends(current_user)):
+    cursor = db.materials.find({"user_id": user["user_id"], "is_deleted": {"$ne": True}}, {"_id": 0}).sort("created_at", -1)
+    items = [material_public(d) async for d in cursor]
+    return {"items": items, "count": len(items)}
+
+
+async def owned_material(material_id: str, user_id: str) -> dict:
+    m = await db.materials.find_one({"material_id": material_id, "user_id": user_id, "is_deleted": {"$ne": True}}, {"_id": 0})
+    if not m:
+        raise HTTPException(404, "Material not found")
+    return m
+
+
+@api.delete("/materials/{material_id}")
+async def delete_material(material_id: str, user: dict = Depends(current_user)):
+    m = await owned_material(material_id, user["user_id"])
+    await db.materials.update_one(
+        {"material_id": material_id, "user_id": user["user_id"]},
+        {"$set": {"is_deleted": True, "deleted_at": now_iso()}},
+    )
+    await db.material_pages.delete_many({"material_id": material_id, "user_id": user["user_id"]})
+    if m.get("storage_path"):
+        try:
+            delete_object(m["storage_path"])
+        except requests.RequestException:
+            logging.warning("Storage delete failed for %s", m["storage_path"])
+    return {"ok": True}
+
+
+@api.post("/materials/{material_id}/retry")
+async def retry_material(material_id: str, user: dict = Depends(current_user)):
+    m = await owned_material(material_id, user["user_id"])
+    if not m.get("storage_path"):
+        raise HTTPException(400, "Original file is not available for retry.")
+    try:
+        data = get_object(m["storage_path"])
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"Could not fetch original file: {exc}")
+    await db.materials.update_one(
+        {"material_id": material_id, "user_id": user["user_id"]},
+        {"$set": {"status": "processing", "error": None}},
+    )
+    await process_and_persist(user["user_id"], material_id, m["filename"], data, m["ext"], m.get("content_type") or "application/octet-stream")
+    saved = await db.materials.find_one({"material_id": material_id, "user_id": user["user_id"]}, {"_id": 0})
+    return material_public(saved)
+
+
+@api.get("/materials/{material_id}/download")
+async def download_material(material_id: str, user: dict = Depends(current_user)):
+    m = await owned_material(material_id, user["user_id"])
+    if not m.get("storage_path"):
+        raise HTTPException(404, "File is not available")
+    try:
+        data = get_object(m["storage_path"])
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"Could not fetch file: {exc}")
+    media = m.get("content_type") or mimetypes.guess_type(m["filename"])[0] or "application/octet-stream"
+    return StreamingResponse(io.BytesIO(data), media_type=media, headers={"Content-Disposition": f'inline; filename="{m["filename"]}"'})
+
+
+@api.get("/materials/{material_id}/pages/{page_number}")
+async def material_page(material_id: str, page_number: int, user: dict = Depends(current_user)):
+    await owned_material(material_id, user["user_id"])
+    page = await db.material_pages.find_one(
+        {"material_id": material_id, "user_id": user["user_id"], "page_number": page_number},
+        {"_id": 0, "tokens": 0},
+    )
+    if not page:
+        raise HTTPException(404, "Page not found")
+    return page
+
+
+# ---------- onboarding ----------
+
+@api.get("/onboarding/status")
+async def onboarding_status(user: dict = Depends(current_user)):
+    ready = await db.materials.count_documents({"user_id": user["user_id"], "is_deleted": {"$ne": True}, "status": "ready"})
+    return {"onboarded": bool(user.get("onboarded")) and ready > 0, "ready_materials": ready}
+
+
+# ---------- retrieval + tutor ----------
+
+async def retrieve_pages(user_id: str, query: str, top_k: int = 5) -> List[dict]:
+    kws = keywords(query)
+    if not kws:
+        return []
+    cursor = db.material_pages.find({"user_id": user_id, "tokens": {"$in": kws}}, {"_id": 0, "tokens": 0}).limit(400)
+    pages = [p async for p in cursor]
+    if not pages:
+        return []
+    # score by overlap frequency
+    kw_set = set(kws)
+    scored = []
+    for p in pages:
+        text_tokens = tokenize(p["text"])
+        hits = sum(1 for t in text_tokens if t in kw_set)
+        scored.append((hits, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [p for _, p in scored[:top_k]]
+    # attach filenames
+    ids = list({p["material_id"] for p in top})
+    mats = {m["material_id"]: m async for m in db.materials.find({"material_id": {"$in": ids}, "user_id": user_id}, {"_id": 0})}
+    for p in top:
+        m = mats.get(p["material_id"], {})
+        p["filename"] = m.get("filename", "Unknown")
+    return top
+
+
+class ChatInput(BaseModel):
+    message: str
+
+
+async def llm_grounded_answer(prompt: str, session_id: str) -> str:
+    key = os.environ.get("EMERGENT_LLM_KEY")
+    if not key:
+        raise HTTPException(500, "LLM key is not configured")
+    system = (
+        "You are Lumina, a careful source-grounded study tutor. "
+        "You MUST answer ONLY using the provided Excerpts from the student's uploaded materials. "
+        "Do not use outside knowledge. Do not invent facts, references, page numbers, or filenames. "
+        "Every factual claim must be followed inline by a citation like [Filename, p.N] exactly as given in the Excerpts. "
+        "After the explanation, add a line beginning with 'Evidence:' listing each citation used. "
+        f"If the Excerpts do not contain enough information to answer, respond with EXACTLY this sentence and nothing else: {NOT_FOUND_MESSAGE}"
+    )
+    chat = LlmChat(api_key=key, session_id=session_id, system_message=system).with_model("gemini", "gemini-3.1-pro-preview")
+    chunks: List[str] = []
+    async for event in chat.stream_message(UserMessage(text=prompt)):
+        if isinstance(event, TextDelta):
+            chunks.append(event.content)
+        elif isinstance(event, StreamDone):
+            break
+    return "".join(chunks).strip()
+
+
+@api.post("/tutor/chat")
+async def tutor_chat(payload: ChatInput, user: dict = Depends(current_user)):
+    question = (payload.message or "").strip()
+    if not question:
+        raise HTTPException(400, "Please ask a question.")
+    ready_count = await db.materials.count_documents({"user_id": user["user_id"], "is_deleted": {"$ne": True}, "status": "ready"})
+    if ready_count == 0:
+        return {
+            "answer": NOT_FOUND_MESSAGE,
+            "citations": [],
+            "grounded": False,
+            "sources_available": 0,
+        }
+
+    pages = await retrieve_pages(user["user_id"], question, top_k=5)
+    if not pages:
+        answer = NOT_FOUND_MESSAGE
+        record = {"id": uuid.uuid4().hex, "user_id": user["user_id"], "role": "assistant", "question": question, "answer": answer, "citations": [], "grounded": False, "created_at": now_iso()}
+        await db.chat_messages.insert_one(record)
+        return {"answer": answer, "citations": [], "grounded": False, "sources_available": ready_count}
+
+    excerpts_text = "\n\n".join(
+        f"[{p['filename']}, p.{p['page_number']}]\n{p['text'][:1200]}" for p in pages
+    )
+    prompt = (
+        f"Student question: {question}\n\n"
+        f"Excerpts from the student's uploaded materials (use ONLY these):\n{excerpts_text}\n\n"
+        "Write a concise explanation grounded in these excerpts. Cite inline like [Filename, p.N]. "
+        "Finish with an 'Evidence:' line listing citations. "
+        f"If the excerpts do not contain enough information, reply with exactly: {NOT_FOUND_MESSAGE}"
+    )
+    try:
+        answer = await llm_grounded_answer(prompt, f"user-{user['user_id']}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("LLM call failed")
+        raise HTTPException(502, f"Tutor is temporarily unavailable: {exc}")
+
+    # Guardrail: if the model produced an answer with no recognizable citation and did not use the fallback, treat as ungrounded.
+    allowed_tags = {f"[{p['filename']}, p.{p['page_number']}]" for p in pages}
+    cited = any(tag in answer for tag in allowed_tags)
+    if not cited and NOT_FOUND_MESSAGE not in answer:
+        answer = NOT_FOUND_MESSAGE
+
+    grounded = NOT_FOUND_MESSAGE not in answer
+    citations = [
+        {"material_id": p["material_id"], "filename": p["filename"], "page": p["page_number"], "excerpt": p["text"][:260]}
+        for p in pages
+    ] if grounded else []
+    record = {"id": uuid.uuid4().hex, "user_id": user["user_id"], "role": "assistant", "question": question, "answer": answer, "citations": citations, "grounded": grounded, "created_at": now_iso()}
     await db.chat_messages.insert_one(record)
-    return {"answer": answer, "citations": EXCERPTS, "grounded": "MATERIAL NOT COVERED" not in answer}
+    return {"answer": answer, "citations": citations, "grounded": grounded, "sources_available": ready_count}
 
-@api.get("/quiz")
-async def quiz():
-    return {"title": "Cellular respiration · Checkpoint", "scope": "Week 04 sources", "question_number": 3, "total": 8, "question": {"id": "q3", "prompt": "Why does the electron transport chain create a gradient?", "type": "MCQ", "topic": "Electron transport chain", "difficulty": "Stretch", "options": ["To split glucose", "To store energy as a proton difference", "To make oxygen", "To produce carbon dioxide"]}, "prior_feedback": "Your last answer showed a strong grasp of glycolysis."}
 
-@api.post("/quiz/submit")
-async def submit_quiz(input: QuizSubmit):
-    correct = input.answer == "To store energy as a proton difference"
-    topic = next(x for x in TOPICS if x["name"] == "Electron transport chain")
-    updated = {**topic, "mastery": min(100, topic["mastery"] + (8 if correct else -4))}
-    feedback = "Exactly — the gradient stores potential energy that ATP synthase can use." if correct else "Not quite. The gradient stores energy as a proton difference; ATP synthase uses it to make ATP."
-    return {"correct": correct, "feedback": feedback, "citation": {"title": "Mitochondria & ATP · Lecture 04", "location": "Slide 12"}, "topic": updated, "report": {"score": 76, "weakest": "Electron transport chain", "misconception": "Confusing electron flow with ATP formation"}}
+@api.get("/tutor/history")
+async def tutor_history(user: dict = Depends(current_user), limit: int = 50):
+    cursor = db.chat_messages.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).limit(min(limit, 200))
+    items = [d async for d in cursor]
+    items.reverse()
+    return {"items": items}
 
-@api.get("/evaluation")
-async def evaluation():
-    return {"faithfulness": 94, "relevancy": 89, "precision": 87, "recall": 82, "repetition": 4, "profiles": [{"name": "New learner", "gain": "+18 pts", "sessions": 4}, {"name": "Visual learner", "gain": "+24 pts", "sessions": 6}, {"name": "Exam crammer", "gain": "+11 pts", "sessions": 3}]}
 
-@api.get("/study-plan")
-async def study_plan():
-    return [{"day": "Today", "title": "Repair the gradient", "detail": "12 min · concept map + 3 questions", "topic": "Electron transport chain", "color": "terracotta"}, {"day": "Tomorrow", "title": "Connect the cycles", "detail": "18 min · retrieval practice", "topic": "Krebs cycle", "color": "forest"}, {"day": "Friday", "title": "Full checkpoint", "detail": "25 min · mixed mock exam", "topic": "All Week 04", "color": "ochre"}]
+# ---------- learner dashboard (user-scoped, computed from real data) ----------
+
+@api.get("/dashboard")
+async def dashboard(user: dict = Depends(current_user)):
+    mats = await db.materials.find({"user_id": user["user_id"], "is_deleted": {"$ne": True}}, {"_id": 0}).to_list(length=200)
+    ready = [m for m in mats if m.get("status") == "ready"]
+    total_pages = sum(m.get("page_count", 0) for m in ready)
+    questions = await db.chat_messages.count_documents({"user_id": user["user_id"]})
+    grounded = await db.chat_messages.count_documents({"user_id": user["user_id"], "grounded": True})
+    confidence = int(round(100 * grounded / questions)) if questions else 0
+    return {
+        "materials": [material_public(m) for m in mats],
+        "ready_count": len(ready),
+        "total_pages": total_pages,
+        "questions": questions,
+        "grounded": grounded,
+        "confidence": confidence,
+        "onboarded": bool(user.get("onboarded")) and len(ready) > 0,
+    }
+
+
+# ---------- misc ----------
+
+@api.get("/")
+async def root():
+    return {"message": "Lumina Academic API", "status": "ok"}
+
 
 app.include_router(api)
 app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origin_regex=r".*", allow_methods=["*"], allow_headers=["*"])
 logging.basicConfig(level=logging.INFO)
+
 
 @app.on_event("shutdown")
 async def shutdown():
